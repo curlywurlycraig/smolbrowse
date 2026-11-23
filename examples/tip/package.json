@@ -1,0 +1,16 @@
+{
+  "name": "smolbrowse-tip",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "asc assembly/index.ts --outFile build/tip.wasm --optimize --runtime stub --use abort= --maximumMemory 256",
+    "test": "node --test test.mjs"
+  },
+  "devDependencies": {
+    "assemblyscript": "0.28.20"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  }
+}

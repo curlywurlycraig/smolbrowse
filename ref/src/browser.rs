@@ -1,4 +1,4 @@
-use crate::{loader, runtime::Site};
+use crate::{input::Event, loader, runtime::Site};
 use anyhow::Result;
 use std::{
     sync::mpsc::{self, Receiver, Sender},
@@ -15,6 +15,7 @@ pub struct Browser {
     pub site: Option<Site>,
     pub current_address: String,
     pub status: String,
+    pub generation: u64,
     animating: bool,
     request: u64,
     sender: Sender<Loaded>,
@@ -28,6 +29,7 @@ impl Browser {
             site: None,
             current_address: String::new(),
             status: String::new(),
+            generation: 0,
             animating: false,
             request: 0,
             sender,
@@ -58,6 +60,7 @@ impl Browser {
         match loaded.result.and_then(|bytes| Site::new(&bytes)) {
             Ok(site) => {
                 self.site = Some(site);
+                self.generation += 1;
                 self.animating = true;
                 self.current_address = loaded.address;
                 self.status.clear();
@@ -72,6 +75,26 @@ impl Browser {
     pub fn poll(&mut self) {
         while let Ok(loaded) = self.receiver.try_recv() {
             self.accept(loaded);
+        }
+    }
+
+    pub fn interactive(&self) -> bool {
+        self.site.as_ref().is_some_and(Site::interactive)
+    }
+
+    pub fn input(&mut self, events: &[Event], overflow: bool) {
+        if !self.animating || !self.interactive() {
+            return;
+        }
+        let result = if overflow {
+            Err(anyhow::anyhow!("input queue exceeds 4096 events"))
+        } else {
+            self.site.as_mut().unwrap().dispatch(events)
+        };
+        if let Err(error) = result {
+            self.animating = false;
+            self.status = format!("Input stopped: {error:#}. Reload to restart.");
+            eprintln!("{}", self.status);
         }
     }
 
@@ -91,6 +114,28 @@ impl Browser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_failure_stops_rendering_and_preserves_last_frame() {
+        let bytes = wat::parse_str(
+            r#"(module
+          (import "smolbrowse" "pixel" (func $p (param i32 i32 i32)))
+          (func (export "event") (param i32) unreachable)
+          (func (export "render") (call $p (i32.const 0) (i32.const 0) (i32.const 42))))"#,
+        )
+        .unwrap();
+        let mut browser = Browser::new();
+        browser.accept(Loaded {
+            id: 0,
+            address: "input.wasm".into(),
+            result: Ok(bytes),
+        });
+        browser.input(&[Event::reset()], false);
+        assert!(!browser.animating);
+        assert!(browser.status.starts_with("Input stopped:"));
+        browser.advance();
+        assert_eq!(browser.site.as_ref().unwrap().frame().pixels[0], 42);
+    }
+
     #[test]
     fn navigation_commits_only_latest_success_and_preserves_page_on_error() {
         let mut browser = Browser::new();

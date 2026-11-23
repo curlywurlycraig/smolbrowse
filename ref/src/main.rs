@@ -2,52 +2,22 @@ mod browser;
 mod chrome;
 mod display;
 mod framebuffer;
+mod input;
 mod loader;
+#[cfg(target_os = "macos")]
+mod native_input;
 mod runtime;
 
 use anyhow::{bail, Context, Result};
 use browser::Browser;
 use chrome::{AddressBar, Command, UiFont};
-use minifb::{InputCallback, Key, ScaleMode, Window, WindowOptions};
+#[cfg(not(target_os = "macos"))]
+use input::Callback;
+use input::{Capture, Event, Raw, Router};
+use minifb::{Key, ScaleMode, Window, WindowOptions};
+#[cfg(not(target_os = "macos"))]
+use minifb::{MouseButton, MouseMode};
 use std::{cell::RefCell, env, rc::Rc};
-
-#[derive(Debug, PartialEq)]
-enum Input {
-    Character(char),
-    Key(Key, bool),
-}
-
-struct TextInput {
-    events: Rc<RefCell<Vec<Input>>>,
-    modifiers: [bool; 4],
-}
-
-impl InputCallback for TextInput {
-    fn add_char(&mut self, value: u32) {
-        if !self.modifiers.iter().any(|down| *down) {
-            if let Some(ch) = char::from_u32(value).filter(|ch| !ch.is_control()) {
-                self.events.borrow_mut().push(Input::Character(ch));
-            }
-        }
-    }
-    fn set_key_state(&mut self, key: Key, state: bool) {
-        let index = match key {
-            Key::LeftSuper => 0,
-            Key::RightSuper => 1,
-            Key::LeftCtrl => 2,
-            Key::RightCtrl => 3,
-            _ => 4,
-        };
-        if index < 4 {
-            self.modifiers[index] = state;
-        }
-        if state {
-            self.events
-                .borrow_mut()
-                .push(Input::Key(key, self.modifiers.iter().any(|down| *down)));
-        }
-    }
-}
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -78,11 +48,14 @@ fn main() -> Result<()> {
     )
     .context("Opening macOS window")?;
     window.set_target_fps(60);
-    let events = Rc::new(RefCell::new(Vec::new()));
-    window.set_input_callback(Box::new(TextInput {
-        events: events.clone(),
-        modifiers: [false; 4],
-    }));
+    let capture = Rc::new(RefCell::new(Capture::default()));
+    #[cfg(not(target_os = "macos"))]
+    window.set_input_callback(Box::new(Callback(capture.clone())));
+    #[cfg(target_os = "macos")]
+    let native_input = native_input::Monitor::new(&window, capture.clone())?;
+    let mut router = Router::default();
+    let mut focused = false;
+    let mut generation = 0;
     let mut clipboard = arboard::Clipboard::new().ok();
     let mut title_address = String::new();
     let mut quit = false;
@@ -90,36 +63,105 @@ fn main() -> Result<()> {
         browser.poll();
         let mut open = false;
         let mut reload = false;
-        // Capture key events and their modifiers together, including presses that
-        // begin and end between two display frames.
-        for event in std::mem::take(&mut *events.borrow_mut()) {
-            let (key, command) = match event {
-                Input::Character(ch) => {
-                    if bar.focused {
-                        bar.insert(&ch.to_string());
-                    } else if ch == ':' {
-                        bar.set("");
-                        bar.focused = true;
-                        browser.status.clear();
-                    } else if ch == 'q' {
-                        quit = true;
+        #[cfg(target_os = "macos")]
+        let buttons = native_input.buttons();
+        #[cfg(not(target_os = "macos"))]
+        let buttons = [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+            .map(|b| window.get_mouse_down(b));
+        #[cfg(target_os = "macos")]
+        let active = native_input.focused();
+        #[cfg(not(target_os = "macos"))]
+        let active = window.is_active();
+        let mut site_events = Vec::new();
+        let mut state = capture.borrow_mut();
+        let mut pending = std::mem::take(&mut state.events);
+        let overflow = std::mem::take(&mut state.overflow);
+        #[cfg(not(target_os = "macos"))]
+        let modifiers = state.modifiers();
+        #[cfg(target_os = "macos")]
+        if generation != browser.generation || focused != (active && !bar.focused) {
+            state.keys = native_input.pressed_keys();
+        }
+        if generation != browser.generation {
+            generation = browser.generation;
+            pending.clear();
+            #[cfg(target_os = "macos")]
+            native_input.reset_text();
+            router.reset(&state.keys, buttons);
+        }
+        let wants_focus = active && !bar.focused;
+        if focused != wants_focus {
+            #[cfg(target_os = "macos")]
+            native_input.reset_text();
+            router.reset(&state.keys, buttons);
+            if focused {
+                site_events.push(Event::reset());
+            }
+            focused = wants_focus;
+        }
+        drop(state);
+        for raw in pending {
+            if !active {
+                continue;
+            }
+            let (key, command) = match raw {
+                Raw::Mouse(..) => {
+                    if focused && !bar.focused {
+                        if let Some(event) = router.raw(raw) {
+                            site_events.push(event);
+                        }
                     }
                     continue;
                 }
-                Input::Key(key, command) => (key, command),
+                Raw::Text(ch, _) => {
+                    if bar.focused {
+                        bar.insert(&ch.to_string());
+                    } else if !browser.interactive() && ch == ':' {
+                        bar.set("");
+                        bar.focused = true;
+                        browser.status.clear();
+                    } else if !browser.interactive() && ch == 'q' {
+                        quit = true;
+                    } else if focused {
+                        if let Some(event) = router.raw(raw) {
+                            site_events.push(event);
+                        }
+                    }
+                    continue;
+                }
+                Raw::Key(key, down, mods) => {
+                    let command = mods & (2 | 8) != 0;
+                    let reserved = (command && matches!(key, Key::L | Key::R)) || key == Key::F5;
+                    if focused && !bar.focused && !reserved && browser.interactive() {
+                        if let Some(event) = router.raw(raw) {
+                            site_events.push(event);
+                        }
+                        continue;
+                    }
+                    if !down {
+                        continue;
+                    }
+                    (key, command)
+                }
             };
             match key {
                 Key::L if command => {
                     bar.set(&browser.current_address);
                     bar.select_all();
                     browser.status.clear();
+                    #[cfg(target_os = "macos")]
+                    native_input.reset_text();
+                    site_events.clear();
+                    site_events.push(Event::reset());
+                    router.reset(&capture.borrow().keys, buttons);
+                    focused = false;
                 }
                 Key::Escape => {
                     bar.focused = false;
                     bar.set(&browser.current_address);
                     browser.status.clear();
                 }
-                Key::R if command || !bar.focused => reload = true,
+                Key::R if command || (!bar.focused && !browser.interactive()) => reload = true,
                 Key::F5 => reload = true,
                 _ if !bar.focused => {}
                 Key::A if command => bar.select_all(),
@@ -168,11 +210,36 @@ fn main() -> Result<()> {
                 browser.navigate(address);
             }
         }
+        let wants_focus = active && !bar.focused;
+        if focused != wants_focus {
+            #[cfg(target_os = "macos")]
+            native_input.reset_text();
+            router.reset(&capture.borrow().keys, buttons);
+            if focused {
+                site_events.clear();
+                site_events.push(Event::reset());
+            }
+            focused = wants_focus;
+        }
+        let viewport = display::viewport(&window);
+        #[cfg(not(target_os = "macos"))]
+        if focused && browser.interactive() {
+            let position = window
+                .get_mouse_pos(MouseMode::Pass)
+                .and_then(|p| input::canvas_position(viewport, p));
+            if position.is_none() && router.capturing() {
+                site_events.clear();
+                site_events.push(Event::reset());
+                router.reset(&capture.borrow().keys, buttons);
+            } else {
+                site_events.extend(router.mouse(position, buttons, modifiers));
+            }
+        }
+        browser.input(&site_events, overflow);
         if browser.current_address != title_address {
             title_address = browser.current_address.clone();
             window.set_title(&format!("smolbrowse — {title_address}"));
         }
-        let viewport = display::viewport(&window);
         if viewport.width > 0 && viewport.height > 0 {
             let pixels = chrome::compose(
                 viewport,
@@ -186,28 +253,4 @@ fn main() -> Result<()> {
         browser.advance();
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod input_tests {
-    use super::*;
-    #[test]
-    fn keeps_shortcuts_when_modifiers_are_released_before_the_next_frame() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut input = TextInput {
-            events: events.clone(),
-            modifiers: [false; 4],
-        };
-        input.set_key_state(Key::LeftSuper, true);
-        input.set_key_state(Key::L, true);
-        input.add_char('l' as u32);
-        input.set_key_state(Key::L, false);
-        input.set_key_state(Key::LeftSuper, false);
-        input.set_key_state(Key::Enter, true);
-        assert!(events.borrow().contains(&Input::Key(Key::L, true)));
-        assert!(events.borrow().contains(&Input::Key(Key::Enter, false)));
-        assert!(!events.borrow().contains(&Input::Character('l')));
-        input.add_char('é' as u32);
-        assert_eq!(events.borrow().last(), Some(&Input::Character('é')));
-    }
 }

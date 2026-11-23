@@ -1,10 +1,10 @@
 # smolbrowse reference implementation
 
-A Rust implementation of the [smolbrowse v1 interface](../docs/plans/001_interface_v1.md).
+A Rust implementation of [smolbrowse v2](../docs/plans/002_interface_v2.md),
+compatible with [v1](../docs/plans/001_interface_v1.md).
 It uses Wasmi to execute pages, minifb for a native macOS window, and font8x8
 for the built-in bitmap font. It displays static and animated pages from local
-files or HTTP(S) URLs. Browser controls stay hidden until invoked; sites still
-use only the two drawing imports. The viewer uses an antialiased macOS monospace
+files or HTTP(S) URLs. Browser controls stay hidden until invoked; sites use two drawing imports and an optional event-detail import. The viewer uses an antialiased macOS monospace
 font for its own UI, separate from the site bitmap font.
 UI text is rasterized at the window's native backing scale on Retina displays.
 The presentation buffer uses physical pixels while UI dimensions remain in
@@ -18,7 +18,8 @@ packages are not required. Run these commands from this directory:
 ```sh
 cd ref # when starting at the repository root
 cargo run --release                                       # empty viewer; : or Cmd+L opens commands
-cargo run --release -- ../examples/cube/build/cube.wasm    # example site from disk
+cargo run --release -- ../examples/cube/build/cube.wasm    # animated v1 site
+cargo run --release -- ../examples/tip/build/tip.wasm      # interactive v2 puzzle
 cargo run --release -- path/to/page.wasm                   # another local page
 cargo run --release -- https://example.org/page.wasm       # hosted page
 ```
@@ -59,8 +60,10 @@ Commands:
 **Cmd+L** opens the prompt with the current address selected; paste or type a
 replacement and press **Enter**. A bare path or URL is accepted without `open`.
 The editor supports **Cmd+A**, **Cmd+C**, **Cmd+V**, arrows, Home, End, Backspace,
-and Delete. Ctrl may be used in place of Cmd. Outside the prompt, **r**,
-**Cmd+R**, or **F5** reloads, and **q** quits. Closing the window also exits.
+and Delete. Ctrl may be used in place of Cmd. For interactive sites, **Cmd/Ctrl+L** opens browser controls;
+**Cmd/Ctrl+R** or **F5** reloads. All ordinary keys, including `:`, `q`, `r`, and
+Escape, go to the site. For v1 sites without an `event` export, the old **:**,
+**r**, and **q** shortcuts remain available. Closing the window also exits.
 
 The 320 × 240 site canvas starts at 3× scale. Resizing preserves its aspect
 ratio with black letterboxing. The command line overlays the bottom of the
@@ -74,6 +77,27 @@ plain text at the bottom; successful loads clear that line. **Escape** dismisses
 an error. Failed loads keep the current page visible, and only the latest
 navigation may replace it. If rendering traps, animation stops with the last
 successful frame visible; reload restarts it. Full errors also go to stderr.
+
+## Site input
+
+V2 sites optionally export `event(i32) -> ()` and import
+`smolbrowse.event_get(i32) -> i32`. Events arrive in order before rendering;
+details are readable only during the callback. The host clears drawing done
+inside handlers before rendering. A handler trap stops input and animation and
+preserves the last committed frame. Opening browser controls or losing window
+focus resets site input, so held keys and mouse drags cannot get stuck.
+
+On macOS, a local AppKit event monitor preserves mouse presses and releases
+between frames, handles all three buttons, and maps window coordinates onto
+the canvas including Retina scaling and letterboxing. An invisible AppKit text
+client handles composition and emits only committed Unicode scalars. Physical
+key codes remain independent of text layout. Mouse drags remain captured outside
+the canvas; loss of window focus cancels capture with an input reset.
+The non-macOS fallback samples mouse buttons once per frame and does not yet
+provide the same mouse-transition fidelity; macOS is the supported native host.
+
+Try [TIP](../examples/tip/README.md) for a site that owns all its game state and
+UI using this interface.
 
 ## macOS app bundle
 
@@ -89,7 +113,9 @@ release. The script builds with the checked-in Cargo lockfile.
 ## Implementation
 
 - `src/framebuffer.rs`: pixel clipping, RGB masking, and transparent 8 × 8 text.
-- `src/runtime.rs`: Wasm imports, instance lifecycle, memory validation, and limits.
+- `src/runtime.rs`: Wasm imports, event dispatch, instance lifecycle, memory validation, and limits.
+- `src/input.rs`: input enums, key translation, focus suppression, and pointer routing.
+- `src/native_input.rs`: macOS event capture and committed text through AppKit.
 - `src/main.rs`: window presentation, input, clipboard, and navigation controls.
 - `src/chrome.rs`: command parsing/editing, monospace UI rendering, and canvas scaling.
 - `src/display.rs`: logical window size and macOS Retina backing-scale detection.
@@ -110,7 +136,9 @@ Implementation resource limits:
 - Source files and compiled modules: 4 MiB each.
 - Linear memory: 16 MiB, at most one memory.
 - Tables: at most one, limited to 4,096 elements.
-- Execution: 10 million Wasmi fuel units for startup and separately for each frame.
+- Execution: 10 million Wasmi fuel units for startup, each frame, and each input batch.
+- Input: at most 4,096 pending native events; overflow stops an interactive site.
+- Event detail reads: one fuel unit each.
 - Host drawing: one fuel unit per pixel call; one plus 64 per UTF-8 byte for text.
 - Text: at most 64 KiB per call.
 - HTTP(S): a 20-second overall request timeout and at most five redirects.
@@ -134,7 +162,10 @@ The rendering core is independent of the window, so tests need no display.
 Tests cover clipping, RGB masking, font placement and transparency, newlines,
 unsupported characters, UTF-8 and pointer validation, the Wasm contract,
 startup clearing, state persistence, frame clearing, failed frame preservation,
-and execution and memory limits. Browser tests cover Unicode address editing,
+event callback scope, signature validation, handler traps, v1/v2 example
+compatibility, and execution and memory limits. Input tests cover paired key/text
+events, repeat suppression, merged equivalent keys, focus resets, pointer
+capture, letterboxing, and Retina coordinate mapping. Browser tests cover Unicode address editing,
 hidden chrome and prompt overlays, command parsing, local-file reloads, file URLs, size limits, HTTP redirects
 and error statuses, stale navigation results, and failed navigation preservation.
 HTTP tests use a local test server and need no internet connection. The example

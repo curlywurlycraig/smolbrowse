@@ -17,12 +17,18 @@ smolbrowse "websites" are `.wasm` that implement the smolbrowse interface. The i
 320 × 240 RGB canvas, an 8 × 8 monospace font, and two drawing functions:
 `smolbrowse.pixel` and `smolbrowse.text`. Sites export a single `render` function.
 The host calls `render` repeatedly while site state persists between frames.
-Links, site networking, and site input are left for future versions.
+Links and site networking are left for future versions.
+
+[Interface v2: input](docs/plans/002_interface_v2.md) adds an optional
+`event(kind)` handler and one `smolbrowse.event_get(field)` import for mouse,
+keyboard, and text input. The reference implementation supports both versions.
 
 ## Example sites
 
 [Examples](examples/README.md) demonstrate the interface. The first is an
 AssemblyScript rotating cube with simple shading and a small compilation step.
+[TIP](examples/tip/README.md) is an interactive isometric puzzle: tip a marked
+cube into a hole with the marked face pointing down.
 
 ## Reference implementation
 

@@ -835,10 +835,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "block2",
  "font8x8",
  "fontdue",
  "minifb",
  "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "raw-window-handle",
  "ureq",
  "url",

@@ -4,7 +4,7 @@ use wasmi::{
     StoreLimitsBuilder, TypedFunc,
 };
 
-use crate::framebuffer::Framebuffer;
+use crate::{framebuffer::Framebuffer, input::Event};
 
 pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -13,6 +13,7 @@ const FUEL: u64 = 10_000_000;
 struct Page {
     frame: Framebuffer,
     limits: StoreLimits,
+    event: Option<Event>,
 }
 
 fn charge(caller: &mut Caller<'_, Page>, cost: u64) -> Result<(), WasmError> {
@@ -30,12 +31,32 @@ fn charge(caller: &mut Caller<'_, Page>, cost: u64) -> Result<(), WasmError> {
 pub struct Site {
     store: Store<Page>,
     render: TypedFunc<(), ()>,
+    event: Option<TypedFunc<i32, ()>>,
     committed: Framebuffer,
 }
 
 impl Site {
     pub fn frame(&self) -> &Framebuffer {
         &self.committed
+    }
+
+    pub fn interactive(&self) -> bool {
+        self.event.is_some()
+    }
+
+    pub fn dispatch(&mut self, events: &[Event]) -> Result<()> {
+        let Some(handler) = self.event else {
+            return Ok(());
+        };
+        // One shared budget per batch, so flooding input cannot multiply fuel.
+        self.store.set_fuel(FUEL)?;
+        for event in events {
+            self.store.data_mut().event = Some(*event);
+            let result = handler.call(&mut self.store, event.kind);
+            self.store.data_mut().event = None;
+            result.context("page event failed")?;
+        }
+        Ok(())
     }
 
     pub fn advance(&mut self) -> Result<()> {
@@ -62,6 +83,7 @@ impl Site {
             &engine,
             Page {
                 frame: Framebuffer::default(),
+                event: None,
                 limits: StoreLimitsBuilder::new()
                     .memory_size(16 * 1024 * 1024)
                     .table_elements(4096)
@@ -74,6 +96,14 @@ impl Site {
         store.limiter(|page| &mut page.limits);
         store.set_fuel(FUEL)?;
         let mut linker = Linker::new(&engine);
+        linker.func_wrap(
+            "smolbrowse",
+            "event_get",
+            |mut caller: Caller<'_, Page>, field: i32| -> Result<i32, WasmError> {
+                charge(&mut caller, 1)?;
+                Ok(caller.data().event.map_or(0, |event| event.get(field)))
+            },
+        )?;
         linker.func_wrap(
             "smolbrowse",
             "pixel",
@@ -128,9 +158,19 @@ impl Site {
         let render = instance
             .get_typed_func::<(), ()>(&store, "render")
             .context("page must export render: () -> ()")?;
+        let event = if instance.get_export(&store, "event").is_some() {
+            Some(
+                instance
+                    .get_typed_func::<i32, ()>(&store, "event")
+                    .context("event must have signature (i32) -> ()")?,
+            )
+        } else {
+            None
+        };
         let mut site = Self {
             store,
             render,
+            event,
             committed: Framebuffer::default(),
         };
         site.advance()?;
@@ -222,6 +262,90 @@ mod tests {
         }
         assert!(Site::new(b"invalid wasm").is_err());
         assert!(Site::new(&vec![0; MAX_MODULE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn event_details_are_scoped_and_state_survives_until_render() {
+        let bytes = wat::parse_str(
+            r#"(module
+          (import "smolbrowse" "event_get" (func $get (param i32) (result i32)))
+          (import "smolbrowse" "pixel" (func $p (param i32 i32 i32)))
+          (global $x (mut i32) (i32.const 0))
+          (func (export "event") (param $kind i32)
+            (global.set $x (i32.add (local.get $kind) (call $get (i32.const 1))))
+            (if (call $get (i32.const -1)) (then unreachable))
+            (if (call $get (i32.const 99)) (then unreachable))
+            (call $p (i32.const 1) (i32.const 0) (i32.const 123)))
+          (func (export "render")
+            (if (call $get (i32.const 1)) (then unreachable))
+            (call $p (i32.const 0) (i32.const 0) (global.get $x))))"#,
+        )
+        .unwrap();
+        let mut site = Site::new(&bytes).unwrap();
+        assert!(site.interactive());
+        site.dispatch(&[Event::new(2, [40, 60, 1, 0, 0, 0])])
+            .unwrap();
+        assert_eq!(site.frame().pixels[0], 0);
+        site.advance().unwrap();
+        assert_eq!(site.frame().pixels[0], 42);
+        assert_eq!(site.frame().pixels[1], 0);
+    }
+
+    #[test]
+    fn validates_event_export_and_limits_handlers() {
+        for export in [
+            r#"(func (export "event"))"#,
+            r#"(global (export "event") i32 (i32.const 0))"#,
+        ] {
+            assert!(page(&format!(r#"(module {export} (func (export "render")))"#)).is_err());
+        }
+        let bytes = wat::parse_str(
+            r#"(module
+          (func (export "event") (param i32) (loop $l (br $l)))
+          (func (export "render")))"#,
+        )
+        .unwrap();
+        let mut site = Site::new(&bytes).unwrap();
+        assert!(site.dispatch(&[Event::reset()]).is_err());
+        assert!(site.store.data().event.is_none());
+    }
+
+    #[test]
+    fn puzzle_runs_in_reference_runtime_within_frame_and_input_limits() {
+        let mut site = Site::new(include_bytes!("../../examples/tip/build/tip.wasm")).unwrap();
+        assert!(site.interactive());
+        // Optional actual-font framebuffer capture for visual inspection.
+        if let Ok(path) = std::env::var("SMOLBROWSE_PREVIEW") {
+            let mut ppm = b"P6\n320 240\n255\n".to_vec();
+            for pixel in &site.frame().pixels {
+                ppm.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8]);
+            }
+            std::fs::write(path, ppm).unwrap();
+        }
+        site.dispatch(&[Event::new(4, [0, 0, 0, 261, 0, 0])])
+            .unwrap();
+        for _ in 0..20 {
+            site.advance().unwrap();
+        }
+        site.dispatch(&[Event::new(4, [0, 0, 0, 90, 0, 0]), Event::reset()])
+            .unwrap();
+        site.advance().unwrap();
+        // Solve the first board, including the sink and complete particle burst.
+        // This exercises the busiest new frames under the real host fuel budget.
+        for key in [261, 261, 261, 263, 263, 261, 263, 263] {
+            site.dispatch(&[Event::new(4, [0, 0, 0, key, 0, 0])])
+                .unwrap();
+            for _ in 0..14 {
+                site.advance().unwrap();
+            }
+        }
+        for _ in 0..80 {
+            site.advance().unwrap();
+        }
+        assert_eq!(site.frame().pixels[166 * 320 + 160], 0xc18b45);
+        // The existing v1 example remains compatible and noninteractive.
+        let old = Site::new(include_bytes!("../../examples/cube/build/cube.wasm")).unwrap();
+        assert!(!old.interactive());
     }
 
     #[test]
