@@ -17,7 +17,7 @@ smolbrowse "websites" are `.wasm` that implement the smolbrowse interface. The i
 320 × 240 RGB canvas, an 8 × 8 monospace font, and two drawing functions:
 `smolbrowse.pixel` and `smolbrowse.text`. Sites export a single `render` function.
 The host calls `render` repeatedly while site state persists between frames.
-Links, networking, and input are left for future versions.
+Links, site networking, and site input are left for future versions.
 
 ## Example sites
 

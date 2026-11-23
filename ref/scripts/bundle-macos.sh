@@ -10,7 +10,8 @@ fi
 cargo build --release --locked
 app=target/release/smolbrowse.app
 mkdir -p "$app/Contents/MacOS"
-cp target/release/smolbrowse "$app/Contents/MacOS/smolbrowse"
+cp target/release/smolbrowse "$app/Contents/MacOS/smolbrowse.new"
+mv "$app/Contents/MacOS/smolbrowse.new" "$app/Contents/MacOS/smolbrowse"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,4 +28,5 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+codesign --force --sign - "$app"
 echo "Built $app"

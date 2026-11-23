@@ -2,7 +2,7 @@
 
 smolbrowse is a fantasy web browser: a small, shared medium for playful,
 personal, artistic experiences. V1 starts with a canvas and two drawing
-functions, supporting static and animated pages. It leaves navigation, networking, input,
+functions, supporting static and animated pages. It leaves site-initiated navigation, networking, input,
 audio, palettes, and additional drawing primitives for later versions.
 
 ## Canvas

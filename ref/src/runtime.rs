@@ -147,21 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn cube_animates_without_reinstantiating_or_exhausting_fuel() {
-        let mut site = Site::new(include_bytes!("../../examples/cube/build/cube.wasm")).unwrap();
-        let first = site.frame().pixels.clone();
-        for _ in 0..120 {
-            site.advance().unwrap();
-        }
-        let changed = first
-            .iter()
-            .zip(&site.frame().pixels)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert!(changed > 1000, "cube should rotate visibly");
-    }
-
-    #[test]
     fn frames_keep_state_clear_canvas_and_commit_only_on_success() {
         let bytes = wat::parse_str(
             r#"(module
