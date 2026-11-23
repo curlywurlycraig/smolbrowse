@@ -13,10 +13,16 @@ smolbrowse "websites" are `.wasm` that implement the smolbrowse interface. The i
 
 ## Specification
 
-[Interface v1](docs/plans/001_interface_v1.md) defines static pages with a
+[Interface v1](docs/plans/001_interface_v1.md) defines static and animated pages with a
 320 × 240 RGB canvas, an 8 × 8 monospace font, and two drawing functions:
 `smolbrowse.pixel` and `smolbrowse.text`. Sites export a single `render` function.
-Links, networking, animation, and input are left for future versions.
+The host calls `render` repeatedly while site state persists between frames.
+Links, networking, and input are left for future versions.
+
+## Example sites
+
+[Examples](examples/README.md) demonstrate the interface. The first is an
+AssemblyScript rotating cube with simple shading and a small compilation step.
 
 ## Reference implementation
 

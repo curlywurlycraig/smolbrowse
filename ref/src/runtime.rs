@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use wasmi::{
     Caller, Config, Engine, Error as WasmError, Linker, Module, Store, StoreLimits,
-    StoreLimitsBuilder,
+    StoreLimitsBuilder, TypedFunc,
 };
 
 use crate::framebuffer::Framebuffer;
@@ -27,87 +27,115 @@ fn charge(caller: &mut Caller<'_, Page>, cost: u64) -> Result<(), WasmError> {
         .map_err(|e| WasmError::new(e.to_string()))
 }
 
-pub fn render(bytes: &[u8]) -> Result<Framebuffer> {
-    if bytes.len() > MAX_MODULE_BYTES {
-        bail!("page exceeds the 4 MiB module limit");
+pub struct Site {
+    store: Store<Page>,
+    render: TypedFunc<(), ()>,
+    committed: Framebuffer,
+}
+
+impl Site {
+    pub fn frame(&self) -> &Framebuffer {
+        &self.committed
     }
-    let mut config = Config::default();
-    config.consume_fuel(true);
-    let engine = Engine::new(&config);
-    let module = Module::new(&engine, bytes).context("invalid Wasm module")?;
-    let mut store = Store::new(
-        &engine,
-        Page {
-            frame: Framebuffer::default(),
-            limits: StoreLimitsBuilder::new()
-                .memory_size(16 * 1024 * 1024)
-                .table_elements(4096)
-                .memories(1)
-                .tables(1)
-                .instances(1)
-                .build(),
-        },
-    );
-    store.limiter(|page| &mut page.limits);
-    store.set_fuel(FUEL)?;
-    let mut linker = Linker::new(&engine);
-    linker.func_wrap(
-        "smolbrowse",
-        "pixel",
-        |mut caller: Caller<'_, Page>, x: i32, y: i32, color: i32| -> Result<(), WasmError> {
-            charge(&mut caller, 1)?;
-            caller
-                .data_mut()
-                .frame
-                .pixel(i64::from(x), i64::from(y), color as u32);
-            Ok(())
-        },
-    )?;
-    linker.func_wrap(
-        "smolbrowse",
-        "text",
-        |mut caller: Caller<'_, Page>,
-         x: i32,
-         y: i32,
-         ptr: i32,
-         len: i32,
-         color: i32|
-         -> Result<(), WasmError> {
-            let len = len as u32 as usize;
-            if len > MAX_TEXT_BYTES {
-                return Err(WasmError::new("text exceeds 64 KiB"));
-            }
-            charge(&mut caller, 1 + len as u64 * 64)?;
-            let memory = caller
-                .get_export("memory")
-                .and_then(|e| e.into_memory())
-                .ok_or_else(|| WasmError::new("text requires exported memory"))?;
-            let start = ptr as u32 as usize;
-            let end = start
-                .checked_add(len)
-                .ok_or_else(|| WasmError::new("text range overflow"))?;
-            let bytes = memory
-                .data(&caller)
-                .get(start..end)
-                .ok_or_else(|| WasmError::new("text range outside memory"))?;
-            let text = std::str::from_utf8(bytes)
-                .map_err(|_| WasmError::new("text is not valid UTF-8"))?
-                .to_owned();
-            caller.data_mut().frame.text(x, y, &text, color as u32);
-            Ok(())
-        },
-    )?;
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .context("could not instantiate page")?
-        .start(&mut store)
-        .context("page start function failed")?;
-    let render = instance
-        .get_typed_func::<(), ()>(&store, "render")
-        .context("page must export render: () -> ()")?;
-    store.data_mut().frame.pixels.fill(0);
-    render.call(&mut store, ()).context("page render failed")?;
-    Ok(store.into_data().frame)
+
+    pub fn advance(&mut self) -> Result<()> {
+        self.store.set_fuel(FUEL)?;
+        self.store.data_mut().frame.pixels.fill(0);
+        self.render
+            .call(&mut self.store, ())
+            .context("page render failed")?;
+        self.committed
+            .pixels
+            .copy_from_slice(&self.store.data().frame.pixels);
+        Ok(())
+    }
+
+    pub fn new(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_MODULE_BYTES {
+            bail!("page exceeds the 4 MiB module limit");
+        }
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, bytes).context("invalid Wasm module")?;
+        let mut store = Store::new(
+            &engine,
+            Page {
+                frame: Framebuffer::default(),
+                limits: StoreLimitsBuilder::new()
+                    .memory_size(16 * 1024 * 1024)
+                    .table_elements(4096)
+                    .memories(1)
+                    .tables(1)
+                    .instances(1)
+                    .build(),
+            },
+        );
+        store.limiter(|page| &mut page.limits);
+        store.set_fuel(FUEL)?;
+        let mut linker = Linker::new(&engine);
+        linker.func_wrap(
+            "smolbrowse",
+            "pixel",
+            |mut caller: Caller<'_, Page>, x: i32, y: i32, color: i32| -> Result<(), WasmError> {
+                charge(&mut caller, 1)?;
+                caller
+                    .data_mut()
+                    .frame
+                    .pixel(i64::from(x), i64::from(y), color as u32);
+                Ok(())
+            },
+        )?;
+        linker.func_wrap(
+            "smolbrowse",
+            "text",
+            |mut caller: Caller<'_, Page>,
+             x: i32,
+             y: i32,
+             ptr: i32,
+             len: i32,
+             color: i32|
+             -> Result<(), WasmError> {
+                let len = len as u32 as usize;
+                if len > MAX_TEXT_BYTES {
+                    return Err(WasmError::new("text exceeds 64 KiB"));
+                }
+                charge(&mut caller, 1 + len as u64 * 64)?;
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .ok_or_else(|| WasmError::new("text requires exported memory"))?;
+                let start = ptr as u32 as usize;
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| WasmError::new("text range overflow"))?;
+                let bytes = memory
+                    .data(&caller)
+                    .get(start..end)
+                    .ok_or_else(|| WasmError::new("text range outside memory"))?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| WasmError::new("text is not valid UTF-8"))?
+                    .to_owned();
+                caller.data_mut().frame.text(x, y, &text, color as u32);
+                Ok(())
+            },
+        )?;
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .context("could not instantiate page")?
+            .start(&mut store)
+            .context("page start function failed")?;
+        let render = instance
+            .get_typed_func::<(), ()>(&store, "render")
+            .context("page must export render: () -> ()")?;
+        let mut site = Self {
+            store,
+            render,
+            committed: Framebuffer::default(),
+        };
+        site.advance()?;
+        Ok(site)
+    }
 }
 
 #[cfg(test)]
@@ -115,15 +143,46 @@ mod tests {
     use super::*;
 
     fn page(source: &str) -> Result<Framebuffer> {
-        render(&wat::parse_str(source).unwrap())
+        Site::new(&wat::parse_str(source).unwrap()).map(|site| site.committed)
     }
 
     #[test]
-    fn bundled_page_renders() {
-        let frame = page(include_str!("../examples/hello.wat")).unwrap();
-        assert_eq!(frame.pixels[0], 0x172438);
-        assert_eq!(frame.pixels[239 * 320 + 160], 0x526f83);
-        assert!(frame.pixels.contains(&0xf5dbb4));
+    fn cube_animates_without_reinstantiating_or_exhausting_fuel() {
+        let mut site = Site::new(include_bytes!("../../examples/cube/build/cube.wasm")).unwrap();
+        let first = site.frame().pixels.clone();
+        for _ in 0..120 {
+            site.advance().unwrap();
+        }
+        let changed = first
+            .iter()
+            .zip(&site.frame().pixels)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > 1000, "cube should rotate visibly");
+    }
+
+    #[test]
+    fn frames_keep_state_clear_canvas_and_commit_only_on_success() {
+        let bytes = wat::parse_str(
+            r#"(module
+          (import "smolbrowse" "pixel" (func $p (param i32 i32 i32)))
+          (global $n (mut i32) (i32.const 0))
+          (func (export "render")
+            (call $p (global.get $n) (i32.const 0) (i32.const 42))
+            (if (i32.eq (global.get $n) (i32.const 2)) (then unreachable))
+            (global.set $n (i32.add (global.get $n) (i32.const 1)))))"#,
+        )
+        .unwrap();
+        let mut site = Site::new(&bytes).unwrap();
+        assert_eq!(site.frame().pixels[0], 42);
+        site.advance().unwrap();
+        assert_eq!(site.frame().pixels[0], 0);
+        assert_eq!(site.frame().pixels[1], 42);
+        assert!(site.advance().is_err());
+        assert_eq!(site.frame().pixels[1], 42);
+        assert_eq!(site.frame().pixels[2], 0);
+        // Reload starts the module's globals over.
+        assert_eq!(Site::new(&bytes).unwrap().frame().pixels[0], 42);
     }
 
     #[test]
@@ -176,8 +235,8 @@ mod tests {
         ] {
             assert!(page(source).is_err());
         }
-        assert!(render(b"invalid wasm").is_err());
-        assert!(render(&vec![0; MAX_MODULE_BYTES + 1]).is_err());
+        assert!(Site::new(b"invalid wasm").is_err());
+        assert!(Site::new(&vec![0; MAX_MODULE_BYTES + 1]).is_err());
     }
 
     #[test]

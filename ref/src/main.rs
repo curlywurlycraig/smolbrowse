@@ -4,12 +4,13 @@ mod runtime;
 use std::{env, fs::File, io::Read, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
-use framebuffer::{Framebuffer, HEIGHT, WIDTH};
+use framebuffer::{HEIGHT, WIDTH};
 use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
+use runtime::Site;
 
-const DEMO: &str = include_str!("../examples/hello.wat");
+const DEMO: &[u8] = include_bytes!("../../examples/cube/build/cube.wasm");
 
-fn load(path: Option<&PathBuf>) -> Result<Framebuffer> {
+fn load(path: Option<&PathBuf>) -> Result<Site> {
     let source = if let Some(path) = path {
         let mut bytes = Vec::new();
         File::open(path)
@@ -21,10 +22,10 @@ fn load(path: Option<&PathBuf>) -> Result<Framebuffer> {
         }
         bytes
     } else {
-        DEMO.as_bytes().to_vec()
+        DEMO.to_vec()
     };
     let wasm = wat::parse_bytes(&source).context("could not read Wasm or WAT page")?;
-    runtime::render(&wasm)
+    Site::new(&wasm)
 }
 
 fn main() -> Result<()> {
@@ -41,9 +42,10 @@ fn main() -> Result<()> {
     let name = path
         .as_ref()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "welcome".into());
+        .unwrap_or_else(|| "rotating cube".into());
     let title = format!("smolbrowse — {name}");
-    let mut frame = load(path.as_ref())?;
+    let mut site = load(path.as_ref())?;
+    let mut animating = true;
     let mut window = Window::new(
         &title,
         WIDTH * 3,
@@ -60,7 +62,8 @@ fn main() -> Result<()> {
         if window.is_key_pressed(Key::R, KeyRepeat::No) {
             match load(path.as_ref()) {
                 Ok(next) => {
-                    frame = next;
+                    site = next;
+                    animating = true;
                     window.set_title(&title);
                 }
                 Err(error) => {
@@ -69,7 +72,16 @@ fn main() -> Result<()> {
                 }
             }
         }
-        window.update_with_buffer(&frame.pixels, WIDTH, HEIGHT)?;
+        window.update_with_buffer(&site.frame().pixels, WIDTH, HEIGHT)?;
+        if animating {
+            if let Err(error) = site.advance() {
+                animating = false;
+                eprintln!("Animation stopped: {error:#}");
+                window.set_title(&format!(
+                    "{title} — render failed (R to reload; see terminal)"
+                ));
+            }
+        }
     }
     Ok(())
 }

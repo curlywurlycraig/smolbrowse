@@ -1,8 +1,8 @@
 # Interface v1
 
 smolbrowse is a fantasy web browser: a small, shared medium for playful,
-personal, artistic experiences. V1 starts with a static page and two drawing
-functions. It intentionally leaves navigation, networking, animation, input,
+personal, artistic experiences. V1 starts with a canvas and two drawing
+functions, supporting static and animated pages. It leaves navigation, networking, input,
 audio, palettes, and additional drawing primitives for later versions.
 
 ## Canvas
@@ -46,10 +46,18 @@ is an unsigned byte count. The browser reads the exact range synchronously;
 there is no terminator. Invalid UTF-8, invalid memory ranges, or missing memory
 on a text call trap the page. Even empty strings must reference a valid range.
 
-The site exports `render` with signature `() -> ()`. The browser creates a fresh
-instance, runs any Wasm start function, clears the canvas, and calls `render`
-once. Only a successful render is displayed. Sites using text must export their
-linear memory as `memory`. Sites using only pixels need not export memory.
+The site exports `render` with signature `() -> ()`. On load, the browser creates
+an instance and runs any Wasm start function once. It then calls `render`
+repeatedly, targeting 60 frames per second. The canvas is cleared to black before
+every call; Wasm globals and memory persist between calls. Reloading creates a
+fresh instance and resets site state. Sites using text must export their linear
+memory as `memory`. Sites using only pixels need not export memory.
+
+Each render call represents one animation tick, nominally 1/60 second. There is
+no clock import or elapsed-time argument. On slower hosts, animation slows with
+the frame rate; hosts do not issue catch-up ticks. A static site simply draws
+the same image each call. Only a successful render is displayed. If a later
+render fails, animation stops and the last successful frame remains visible.
 
 ## Host behavior
 
